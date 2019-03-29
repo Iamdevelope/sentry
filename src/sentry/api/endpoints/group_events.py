@@ -12,6 +12,7 @@ from functools import partial
 from sentry import options, quotas, tagstore
 from sentry.api.base import DocSection, EnvironmentMixin
 from sentry.api.bases import GroupEndpoint
+from sentry.api.event_search import get_snuba_query_args
 from sentry.api.exceptions import ResourceDoesNotExist
 from sentry.api.helpers.environments import get_environments
 from sentry.api.serializers import serialize, SimpleEventSerializer
@@ -73,37 +74,47 @@ class GroupEventsEndpoint(GroupEndpoint, EnvironmentMixin):
         return backend(request, group, environments, query, tags, start, end)
 
     def _get_events_snuba(self, request, group, environments, query, tags, start, end):
-        conditions = []
-        if query:
-            msg_substr = ['positionCaseInsensitive', ['message', "'%s'" % (query,)]]
-            message_condition = [msg_substr, '!=', 0]
-            if is_event_id(query):
-                or_condition = [message_condition, ['event_id', '=', query]]
-                conditions.append(or_condition)
-            else:
-                conditions.append(message_condition)
-
-        if tags:
-            for tag_name, tag_val in tags.items():
-                operator = 'IN' if isinstance(tag_val, list) else '='
-                conditions.append([u'tags[{}]'.format(tag_name), operator, tag_val])
-
         default_end = timezone.now()
         default_start = default_end - timedelta(days=90)
+        params = {
+            'issue.id': [group.id],
+            'project_id': [group.project_id],
+            'start': start if start else default_start,
+            'end': end if end else default_end
+        }
+        if is_event_id(query):
+            # TODO: Refactor this so that it's not just copy/pasted from
+            #  organization_events.py
+            snuba_args = get_snuba_query_args(
+                query=u'id:{}'.format(query),
+                params=params,
+            )
+
+            results = raw_query(
+                selected_columns=SnubaEvent.selected_columns,
+                referrer='api.organization-events',
+                **snuba_args
+            )['data']
+
+            if len(results) == 1:
+                response = Response(
+                    serialize([SnubaEvent(row) for row in results], request.user)
+                )
+                response['X-Sentry-Direct-Hit'] = '1'
+                return response
+
+        if environments:
+            params['environment'] = [env.name for env in environments]
+
+        snuba_args = get_snuba_query_args(request.GET.get('query', None), params)
 
         data_fn = partial(
             # extract 'data' from raw_query result
             lambda *args, **kwargs: raw_query(*args, **kwargs)['data'],
-            start=max(start, default_start) if start else default_start,
-            end=min(end, default_end) if end else default_end,
-            conditions=conditions,
-            filter_keys={
-                'project_id': [group.project_id],
-                'issue': [group.id]
-            },
             selected_columns=SnubaEvent.selected_columns,
             orderby='-timestamp',
             referrer='api.group-events',
+            **snuba_args
         )
 
         serializer = SimpleEventSerializer()
